@@ -1,0 +1,943 @@
+devtools::install_github(repo = "saberpowers/sabRmetrics")
+
+d21 <- sabRmetrics::download_baseballsavant(
+  start_date = "2021-01-01",
+  end_date = "2021-12-31"
+)
+
+d22 <- sabRmetrics::download_baseballsavant(
+  start_date = "2022-01-01",
+  end_date = "2022-12-31"
+)
+
+d23 <- sabRmetrics::download_baseballsavant(
+  start_date = "2023-01-01",
+  end_date = "2023-12-31"
+)
+
+d24 <- sabRmetrics::download_baseballsavant(
+ start_date = "2024-01-01",
+  end_date = "2024-12-31"
+)
+d25 <- sabRmetrics::download_baseballsavant(
+ start_date = "2025-01-01",
+  end_date = "2025-12-31"
+)
+load("stuffplus.RData")
+
+
+calculate_vaa <- function(data) {
+  yf <- 17 / 12      
+  
+  data <- data %>%
+    mutate(
+      vy_f = -sqrt(vy0 ** 2 - (ay * 2 * (50 - yf))), 
+      time = (vy_f - vy0) / ay,
+      vz_f = vz0 + az * time,  
+      vaa = -atan(vz_f / vy_f) * (180 / pi)  
+    )
+  
+  return(data)
+}
+
+data <- calculate_vaa(data)
+data <- rbind(d21, d22, d23, d24)
+
+ids <- read_csv("player_ids.csv")
+
+pitcher_ids <- ids %>% 
+    select(player_id, name) %>% 
+    rename(pitcher_id = player_id)
+
+data <- merge(data, pitcher_ids, by = "pitcher_id")
+
+data$pitcher_team <- ifelse(data$inning_topbot == "Top", data$home_team, data$away_team)
+data <- data %>% 
+   mutate(stand = ifelse(bat_side == "R", 1, 0),
+         plate_x = plate_x * -12, p_throws = ifelse(pitch_hand == "R", 1, 0), pfx_x = pfx_x * -12) %>% 
+  mutate(plate_x = round(plate_x, 1),
+           plate_z = round(plate_z, 1),
+         on_3b = ifelse(!is.na(pre_runner_3b_id), 1, 0),
+         on_2b = ifelse(!is.na(pre_runner_2b_id), 1, 0),
+         on_1b = ifelse(!is.na(pre_runner_1b_id), 1, 0))
+
+max <- data %>% 
+  filter(pitch_type %in% c("FF", "FA", "SI")) %>% 
+  select(pitcher_id, pitch_type, release_speed, az, year) %>% 
+  na.omit() %>% 
+  group_by(pitcher_id, year) %>% 
+  summarise(mean_release_speed = mean(release_speed), mean_az = mean(az))
+
+data <- left_join(data, max, by = c("pitcher_id", "year"))
+
+data <- data %>% 
+  mutate(delta_release_speed = release_speed - mean_release_speed,
+         delta_az = az - mean_az) %>% 
+  select(-mean_az, -mean_release_speed)
+
+data <- data %>% 
+  group_by(balls, strikes, description, on_3b, on_2b, on_1b) %>%
+  mutate(mean_delta_run_exp = mean(delta_pitcher_run_exp, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(delta_run_exp = ifelse(description == "hit_into_play", delta_pitcher_run_exp, mean_delta_run_exp)) %>%
+  select(-mean_delta_run_exp)
+
+data <- data %>% 
+  mutate(ax = ax * 12,
+         az = az * 12, 
+         plate_z = plate_z * 12, 
+         pfx_z = pfx_z * 12, 
+         ay = ay * 12)
+
+data <- data %>% 
+  mutate(ax = abs(ax))
+
+data <- data %>% 
+ drop_na(ax, az, release_speed, pitcher_id, name, pitch_name, p_throws, arm_angle, release_pos_z, release_spin_rate, 
+          delta_release_speed, delta_az, delta_run_exp, extension, year)
+
+matrix <- xgb.DMatrix(as.matrix(select(data, release_speed, ax, az, release_pos_z,
+                                       extension, release_spin_rate,
+                                       delta_release_speed, delta_az, arm_angle)),
+                      label = data$delta_run_exp)
+
+data$stuff_plus <- predict(bst, matrix)
+
+data$stuff_plus <- round(scale(data$stuff_plus) * 20 + 100)
+spin <- read_csv("spin-direction-pitches.csv") %>% 
+  rename(name = `last_name, first_name`)
+
+spin <- spin %>%
+  select(name, api_pitch_name, active_spin_formatted,
+         hawkeye_measured_clock_label, movement_inferred_clock_label,
+         hawkeye_measured, movement_inferred) %>%
+  separate(name, into = c("LastName_Pitcher", "FirstName_Pitcher"), sep = ", ") %>%
+  unite(player_name, FirstName_Pitcher, LastName_Pitcher, sep = " ") %>%
+  rename(`Pitch Type` = api_pitch_name,
+         active_spin = active_spin_formatted,
+         measured_spin = hawkeye_measured_clock_label,
+         observed_spin = movement_inferred_clock_label)
+trajectory_data <- data |>
+  sabRmetrics::get_quadratic_coef(source = "baseballsavant") |>
+  sabRmetrics::get_trackman_metrics()
+
+
+trajectory_data <- trajectory_data %>% 
+  mutate(t_0 = 0, 
+         bx = bx * 12, 
+         bz = bz * 12, 
+         release_x = release_x * 12, 
+         release_z = release_z * 12, 
+         by = by * 12, 
+         release_y = release_y * 12)
+data <- data %>% 
+  mutate(pitch_type = case_when(
+    pitch_type == "KC" ~ "CU",
+    T ~ pitch_type
+  )) %>% 
+   mutate(pitch_name = case_when(
+    pitch_name == "Knuckle Curve" ~ "Curveball",
+    T ~ pitch_name
+  ))
+
+pitch_colors <- c(
+  "4-Seam Fastball" = "#0259d4",
+  "Changeup" = "#0a6e28",
+  "Curveball" = "#f73620",
+  "Cutter" = "#5604c9",
+  "Eephus" = "#0cf7e4",
+  "Forkball" = "#027525",
+  "Knuckleball" = "#b35f0b",
+  "Other" = "black",
+  "Screwball" = "#8a810b",
+  "Sinker" = "#02e1f5",
+  "Slider" = "#be3af2",
+  "Slurve" = "#f05411",
+  "Split-Finger" = "#11b880",
+  "Sweeper" = "#fc03b1"
+)
+player_info <- function(player) {
+  
+#calculate age
+  ids <- ids %>% 
+    mutate(player_age = floor(interval(birthDate, today()) / years(1))) %>% 
+    filter(name == player) 
+
+ #get handedness
+  hand <- data %>% 
+    filter(name == player) %>% 
+    mutate(pitcher_hand = ifelse(p_throws == 0, "LHP", "RHP")) %>% 
+    slice_head(n = 1) %>% 
+    pull(pitcher_hand)
+
+#pull player's name, age, height, weight, and id
+  name_parts <- strsplit(player, " ")[[1]]
+  first_name <- name_parts[1]
+  last_name <- name_parts[2]
+  age <- ids %>%
+    pull(player_age)
+  height <- ids %>%
+    pull(height)
+  weight <- ids %>%
+    pull(weight)
+  
+  id <- ids %>%
+    pull(player_id)
+  
+#this scrapes the MLB api to download a headshot directly
+  url <- paste0(
+    "https://img.mlbstatic.com/mlb-photos/image/",
+    "upload/d_people:generic:headshot:67:current.png",
+    "/w_640,q_auto:best/v1/people/", id, "/headshot/silo/current.png"
+  )
+  
+  img <- image_read(url)
+  raster_img <- rasterGrob(as.raster(img)) 
+  
+#plot the headshot
+  p1 <- ggplot() +
+    annotation_custom(raster_img, xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf) +
+    theme_void() +
+    theme(plot.margin = margin(0, 0, 0, 0))
+  
+#plot information
+  p2 <- ggplot() +
+  annotate(
+    "text", x = 0, y = 0.00, 
+    label = paste0(first_name, " ", last_name),
+    color = "#0c2340", size = 24, hjust = 0.5, vjust = .25, fontface = "bold"
+  ) +
+  annotate(
+    "text", x = 0, y = 0, 
+    label = paste0(hand, " ", height, " ", weight, " lbs Age ", age),
+    color = "#0c2340", size = 15, hjust = 0.5, vjust = 2.4, fontface = "italic", lineheight = 0.8
+  ) +
+  theme_void() +
+  theme(plot.margin = margin(0, 0, 0, 0))
+  
+#plot the team logo
+  abv <- data %>%
+    filter(name == player) %>%
+    arrange(desc(game_date)) %>%
+    slice_head(n = 1) %>%
+    pull(pitcher_team)
+  
+  p3 <- ggplot() +
+    mlbplotR::geom_mlb_logos(aes(x = 0, y = 0, team_abbr = abv), width = 0.5, vjust = .5) +
+    theme_void() +
+    theme(plot.margin = margin(0, 0, 0, 0))
+  
+#combine all three aspects onto one graph
+  grid.arrange(p1, p2, p3, ncol = 3, widths = c(0.25, 0.5, 0.25))
+}
+pitch_summary <- function(pitcher, game_year, data){   
+  selected_pitcher <- pitcher
+  
+  data <- data %>% 
+    filter(year == game_year)
+
+#create the domains for the color scales
+  ext_domain <- data %>%
+    group_by(name) %>%
+    summarise(extension = mean(extension)) %>%
+    arrange(desc(extension)) %>%
+    summarise(min = floor(min(extension)), max = ceiling(max(extension)))
+
+  domains <- data %>%
+    group_by(name, pitch_name) %>%
+    summarise(n = n(), mean = mean(release_speed), spin = mean(release_spin_rate)) %>%
+    filter(n > 50) %>%
+    ungroup() %>%
+    group_by(pitch_name) %>%
+    summarise(min_velo = floor(min(mean)), max_velo = ceiling(max(mean)),
+              min_spin = floor(min(spin)), max_spin = ceiling(max(spin))) %>%
+    mutate(min_velo = as.numeric(min_velo),
+           max_velo = as.numeric(max_velo),
+           min_spin = as.numeric(min_spin),
+           max_spin = as.numeric(max_spin))
+
+#filter for pitches thrown more than 1% of the time
+  types <- data %>%
+    filter(name == selected_pitcher) %>%
+    group_by(pitch_name) %>%
+    summarise(n = 100 * n() / nrow(data %>% filter(name == selected_pitcher))) %>%
+    filter(n >= 1)
+
+  types <- unique(types$pitch_name)
+
+  spin <- spin %>%
+    filter(player_name == selected_pitcher) %>%
+    select(-player_name)
+
+#group by pitch and summarize all metrics
+  pitcher_summary <- data %>%
+    filter(name == selected_pitcher) %>%
+    filter(pitch_name %in% types) %>%
+    group_by(pitch_name) %>%
+    summarise(
+      Usage = round((n() / nrow(data %>% filter(name == selected_pitcher))) * 100, 1),
+      Velo = round(mean(release_speed), 1),
+      spin = round(mean(release_spin_rate)),
+      hb = round(mean(pfx_x), 1),
+      ivb = round(mean(pfx_z), 1),
+      vaa = round(mean(vaa), 1),
+      ext = round(mean(extension), 1),
+      hrel = round(mean(-release_pos_x), 1),
+      vrel = round(mean(release_pos_z), 1),
+      `Stuff+` = round(mean(stuff_plus))
+    ) %>%
+    rename(`Pitch Type` = pitch_name) %>%
+    arrange(desc(Usage))
+
+  pitcher_summary <- pitcher_summary %>%
+    left_join(spin, by = c("Pitch Type")) %>%
+    rename(eff = active_spin,
+           measured = measured_spin,
+           observed = observed_spin) %>%
+    mutate(
+      measured = substr(measured, 1, 5),
+      observed = substr(observed, 1, 5)
+    ) %>%
+    filter(Usage >= 1)
+
+  pitcher_summary <- pitcher_summary %>%
+    select(`Pitch Type`, Usage, Velo, spin, eff, measured, observed, vaa,
+           hb, ivb, ext, hrel, vrel, `Stuff+`)
+
+#create table, using special gt theme
+  pitcher_summary <- pitcher_summary %>%
+    gt() %>%
+    gt_theme_538() %>%
+    cols_align(align = "center", columns = everything())
+
+#assign color to columns that I specify
+  pitcher_summary <- pitcher_summary %>%
+    data_color(
+      columns = `Pitch Type`,
+      colors = scales::col_factor(
+        palette = pitch_colors,
+        domain = names(pitch_colors),
+        na.color = "white"
+      )
+    )
+
+  for (pitch in types) {
+    min_velo <- domains %>% filter(pitch_name == pitch) %>% pull(min_velo)
+    max_velo <- domains %>% filter(pitch_name == pitch) %>% pull(max_velo)
+
+    pitcher_summary <- pitcher_summary %>%
+      data_color(
+        columns = Velo,
+        rows = `Pitch Type` == pitch,
+        palette = c("#056af7", "white", "#ff5100"),
+        domain = c(min_velo, max_velo)
+      )
+
+    min_spin <- domains %>% filter(pitch_name == pitch) %>% pull(min_spin)
+    max_spin <- domains %>% filter(pitch_name == pitch) %>% pull(max_spin)
+
+    pitcher_summary <- pitcher_summary %>%
+      data_color(
+        columns = spin,
+        rows = `Pitch Type` == pitch,
+        palette = c("#056af7", "white", "#ff5100"),
+        domain = c(min_spin, max_spin)
+      )
+  }
+
+  pitcher_summary <- pitcher_summary %>%
+    data_color(
+      columns = `Stuff+`,
+      colors = scales::col_numeric(
+        palette = c("#056af7", "white", "#ff5100"),
+        domain = c(50, 150),
+        na.color = "white"
+      )
+    ) %>%
+    data_color(
+      columns = c(ext),
+      colors = scales::col_numeric(
+        palette = c("#056af7", "white", "#ff5100"),
+        domain = c(ext_domain$min, ext_domain$max),
+        na.color = "white"
+      )
+    ) %>%
+    data_color(
+      columns = c(eff),
+      colors = scales::col_numeric(
+        palette = c("#056af7", "white", "#ff5100"),
+        domain = c(0, 100),
+        na.color = "white"
+      )
+    )
+
+  pitcher_summary
+}
+velo <- function(player, game_year, data){    
+  
+  data <- data %>% 
+    filter(year == game_year)
+  
+#filter for pitches thrown more than 1% of the time
+  types <- data %>%
+    filter(name == player) %>%
+    group_by(pitch_name) %>%
+    summarise(n = 100 * n() / nrow(data %>% filter(name == player))) %>%
+    filter(n >= 1) %>%
+    arrange(desc(n))
+  
+  types <- unique(types$pitch_name)
+  
+  data_filtered <- data %>%
+    filter(name == player & pitch_name %in% types) %>%
+    group_by(pitch_name) %>%
+    mutate(total_pitches = n()) %>%
+    ungroup() %>%
+    rename(`Pitch Type` = pitch_name)
+  
+#create x and y limits
+  min_velo <- data_filtered %>%
+    filter(!is.na(release_speed)) %>%
+    summarise(min = min(release_speed)) %>%
+    pull(min)
+  
+  min_velo <- min_velo - 3
+  
+  max_velo <- data_filtered %>%
+    filter(!is.na(release_speed)) %>%
+    summarise(max = max(release_speed)) %>%
+    pull(max)
+  
+  max_velo <- max_velo + 3
+  
+#find average velo for each pitch
+  avg_speed <- data_filtered %>%
+    group_by(`Pitch Type`) %>%
+    summarize(
+      avg_speed = mean(release_speed),
+      usage_pct = n() / nrow(data_filtered) * 100
+    )
+  
+#create the plot
+  data_filtered %>%
+    arrange(desc(total_pitches)) %>%
+    ggplot(aes(x = release_speed, fill = `Pitch Type`)) + 
+    geom_density(alpha = 0.6) + 
+    geom_point(data = avg_speed, aes(x = avg_speed, y = 0.01, color = `Pitch Type`), size = 3, shape = 21, stroke = 0.3) + 
+    geom_segment(data = avg_speed, aes(x = avg_speed, xend = avg_speed, y = 0, yend = Inf, color = `Pitch Type`), linetype = "dashed") + 
+    facet_grid(`Pitch Type` ~ ., scales = "free_y", switch = "y") + 
+    theme_minimal() + 
+    xlim(min_velo, max_velo) + 
+    xlab("Velocity (MPH)") + 
+    theme(
+      legend.position = "none",
+      strip.text.y = element_blank(),
+      plot.title = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      strip.background = element_blank(),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor.y = element_blank(),
+      legend.title = element_blank(),
+      axis.text.x = element_text(size = 25),
+      axis.title.y = element_blank(),
+      axis.title.x = element_text(size = 25),
+      panel.background = element_rect(fill = "#ffffff")
+    ) + 
+    scale_fill_manual(values = pitch_colors) + 
+    scale_color_manual(values = pitch_colors)
+}
+movement <- function(player, game_year, data) {
+  
+  data <- data %>% 
+    filter(year == game_year)
+  
+  data <- data %>%
+    filter(name == player) %>%
+    group_by(pitch_name) %>%
+    mutate(
+      pct = n() / nrow(data %>% filter(name == player))
+    ) %>% 
+    filter(pct >= .01) %>% 
+    ungroup()
+  
+  data %>% 
+  ggplot(aes(x = pfx_x, y = pfx_z)) +
+    geom_circle(aes(x0 = 0, y0 = 0, r = 25), size = .25, color = "black", fill = NA, linetype = "dashed", alpha = .5) +
+    geom_circle(aes(x0 = 0, y0 = 0, r = 20), size = .25, color = "black", fill = NA) +
+    geom_circle(aes(x0 = 0, y0 = 0, r = 15), size = .25, color = "black", fill = NA, linetype = "dashed", alpha = .5) +
+    geom_circle(aes(x0 = 0, y0 = 0, r = 10), size = .25, color = "black", fill = NA) +
+    geom_circle(aes(x0 = 0, y0 = 0, r = 5), size = .25, color = "black", fill = NA, linetype = "dashed", alpha = .5) +
+    geom_segment(aes(x = 0, y = -25, xend = 0, yend = 25), color = "black", linetype = "dashed") +
+    geom_segment(aes(x = -25, y = 0, xend = 25, yend = 0), color = "black", linetype = "dashed") +
+    geom_point(aes(fill = pitch_name), alpha = .8, shape = 21, color = "black", stroke = .5, size = 5) +
+    annotate("text", x = 20, y = 0, label = "20", vjust = -.5, hjust = 1.2) +
+    annotate("text", x = 10, y = 0, label = "10", vjust = -.5, hjust = 1.2) +
+    annotate("text", x = -20, y = 0, label = "20", vjust = -.5, hjust = -.2) +
+    annotate("text", x = -10, y = 0, label = "10", vjust = -.5, hjust = -.2) +
+    annotate("text", x = 0, y = 20, label = "20", hjust = -.2, vjust = -.5) +
+    annotate("text", x = 0, y = -20, label = "20", hjust = -.2, vjust = -.5) +
+    annotate("text", x = 0, y = 10, label = "10", hjust = -.2, vjust = -.5) +
+    annotate("text", x = 0, y = -10, label = "10", hjust = -.2, vjust = -.5) +
+    annotate("text", x = -18.5, y = 25,  
+            label = "← Towards 1B", color = "black", size = 5, hjust = 0.5) +
+   annotate("text", x = 18.5, y = 25, 
+            label = "Towards 3B →", color = "black", size = 5, hjust = 0.5) +
+    scale_x_continuous("Horizontal Movement (in)", limits = c(-25, 25), breaks = seq(-20, 20, by = 10)) +
+    scale_y_continuous("Induced Vertical Movement (in)", limits = c(-25, 25), breaks = seq(-20, 20, by = 10)) +
+    scale_fill_manual(values = pitch_colors) +
+    scale_color_manual(values = pitch_colors) +
+    coord_equal() +
+    theme_minimal() +
+    theme(
+      plot.title = element_blank(),
+      legend.position = "none",
+      panel.background = element_rect(fill = "#ffffff"),
+      legend.title = element_blank(),
+      axis.text.x = element_text(size = 20),
+                  axis.text.y = element_text(size = 20),
+                  axis.title.x = element_text(size = 20),
+                  axis.title.y = element_text(size = 20)
+    )
+}
+tunnels <- function(player, game_year, data){
+  
+#create a target of right down the middle
+  target_x <- 0
+  target_z <- 30
+  
+  data <- data %>%
+   filter(year == game_year)
+    
+   data <- data %>%
+   filter(name == player) %>%
+    group_by(pitch_name) %>%
+    mutate(
+      pct = n() / nrow(data %>% filter(name == player))
+    ) %>% 
+    filter(pct >= .01) %>% 
+    ungroup()
+  
+#filter for rows where pitch release is close to the mean
+  data <- data %>%
+    filter(name == player) %>% 
+    group_by(pitch_name) %>%
+    mutate(
+      release_x_mean = mean(release_pos_x, na.rm = TRUE),
+      release_z_mean = mean(release_pos_z, na.rm = TRUE)
+    ) %>%
+    ungroup() %>%
+    filter(
+      abs(release_pos_x - release_x_mean) <= 0.2 & 
+      abs(release_pos_z - release_z_mean) <= 0.2
+    )
+  
+#find distance from initial coordinates to our target
+  data <- data %>%
+    filter(pitch_name %in% names(pitch_colors)) %>% 
+    mutate(
+      initial_x = plate_x - pfx_x,
+      initial_z = plate_z - pfx_z,
+      distance_to_0_30 = sqrt((initial_x - 0)^2 + (initial_z - 30)^2)  
+    )
+ 
+  #find the pitch for each type closest to right down the middle
+  data <- data %>%
+    filter(name == player) %>% 
+    mutate(distance = sqrt((initial_x - target_x)^2 + (initial_z - target_z)^2)) %>%
+    group_by(pitch_name) %>%
+    slice_min(distance, n = 1) %>% 
+    ungroup() 
+  
+#plot the location of the pitch in the air at 50 points during it's journey
+#locations that end in 0 are release and 50 is the final location
+  for (i in 0:50) {
+    t <- (i / 50) * data$plate_time
+    
+    data <- data %>%
+      mutate(
+        !!paste0("x_", i) := release_x + bx * t + 0.5 * ax * t^2,
+        !!paste0("z_", i) := release_z + bz * t + 0.5 * az * t^2, 
+        !!paste0("y_", i) := release_y + by * t + 0.5 * ay * t^2
+      )
+  }
+ 
+  
+  x_columns <- paste0("x_", 0:50)
+  z_columns <- paste0("z_", 0:50)
+  
+#define plot limits
+  x_max <- round(max(abs(data[x_columns]), na.rm = TRUE) + 3)
+  z_max <- round(max(abs(data[z_columns]), na.rm = TRUE) + 3)
+
+#plot the plate and strike zone
+  p <- ggplot(data) + 
+    geom_rect(
+      xmin = -8.5, xmax = 8.5, ymin = 18, ymax = 42,
+      fill = NA, color = "black"
+    ) +
+    geom_segment(aes(x = -7.5, y = 6, xend = 7.5, yend = 6), color = "black") +
+    geom_segment(aes(x = -7.5, y = 6, xend = -10, yend = 4), color = "black") +
+              geom_segment(aes(x = 7.5, y = 6, xend = 10, yend = 4), color = "black") +
+              geom_segment(aes(x = 0, y = 2, xend = 10, yend = 4), color = "black") +
+              geom_segment(aes(x = 0, y = 2, xend = -10, yend = 4), color = "black") +
+    scale_x_continuous("Horizontal Location (in)", limits = c(-x_max, x_max), breaks = seq(-x_max, x_max, by = 12)) +
+    scale_y_continuous("Vertical Location (in)", limits = c(0, z_max), breaks = seq(0, z_max, by = 12)) +
+    theme_void() + 
+    coord_equal() +
+    ggtitle(paste0("Pitch Trajectories")) +
+    theme(legend.position = "none", 
+          plot.title = element_text(hjust = .5, size = 20))
+    
+  #add all of the points 
+  for (t in 0:50) {
+    p <- p + 
+      geom_point(aes(x = !!sym(paste0("x_", t)), y = !!sym(paste0("z_", t)), fill = pitch_name), shape = 21, 
+                 color = "black", stroke = .15, size = 3) + 
+      scale_fill_manual(values = pitch_colors) 
+  }
+  
+  print(p)
+  
+}
+tilt <- function(player, game_year, data) {
+
+ #transform the spin data to make sure that data on both sides of 12 are in
+ #fact different, then pivot
+  pitches <- spin %>%
+  filter(player_name == player) %>%
+  mutate(hawkeye_measured = -hawkeye_measured + 540,
+         movement_inferred = -movement_inferred + 540) %>%
+  mutate(hawkeye_measured = ifelse(hawkeye_measured > 360, hawkeye_measured - 360, hawkeye_measured),
+         movement_inferred = ifelse(movement_inferred > 360, movement_inferred - 360, movement_inferred)) %>%
+  mutate(hawkeye_measured = as.numeric(hawkeye_measured),
+         movement_inferred = as.numeric(movement_inferred)) %>%
+  rename(Measured = hawkeye_measured,
+         Observed = movement_inferred) %>%
+  select(`Pitch Type`, Measured, Observed) %>%
+  pivot_longer(cols = c(Measured, Observed), 
+               names_to = "measurement_type", 
+               values_to = "angle")
+  
+#create the plot of a clock
+  hour_positions <- data.frame(
+    hour = 1:12,
+    angle = seq(30, 360, by = 30)
+  )
+  
+  types <- data %>% 
+     filter(name == player& year == game_year) %>% 
+    group_by(pitch_name) %>% 
+    summarise(n = 100 * n() / nrow(data %>% 
+     filter(name == player & year == game_year))) %>% 
+    filter(n >= 1) 
+  
+  types <- unique(types$pitch_name)
+  
+#plot an arrow with the tilt on the clock plot
+  pitches %>% 
+    filter(`Pitch Type` %in% types) %>% 
+  ggplot() +
+    geom_circle(aes(x0 = 0, y0 = 0, r = 1), size = 1, color = "black", fill = "#ffffff") +
+    geom_text(data = hour_positions,
+              aes(x = 0.85 * cos(pi/180 * (90 - angle)),
+                  y = 0.85 * sin(pi/180 * (90 - angle)),
+                  label = hour), size = 5) +
+    geom_segment(aes(x = 0, y = 0,
+                     xend = cos(pi/180 * (90 - angle)),
+                     yend = sin(pi/180 * (90 - angle)),
+                     color = `Pitch Type`),
+                 size = 1.5, arrow = arrow(length = unit(0.5, "cm"))) +
+    geom_circle(aes(x0 = 0, y0 = 0, r = .25), size = 1, color = "black", fill = "white") +
+    geom_circle(aes(x0 = 0, y0 = 0, r = .06), size = 1, color = "black", fill = "black") +
+    scale_color_manual(values = pitch_colors) +
+    ggtitle("") +
+    coord_fixed() + 
+    theme_void() +
+      facet_wrap(~measurement_type, ncol = 2) + 
+    theme(legend.position = "none", 
+          strip.text = element_text(size = 20))
+}
+approach_angles <- function(player, game_year, data){
+  
+  dat <- data %>% 
+   filter(name == player & year == game_year)
+  
+  dat <- dat %>%
+    group_by(pitch_name) %>%
+    mutate(
+      pct = n() / nrow(dat %>% filter(name == player))
+    ) %>% 
+    filter(pct >= .01 & pitch_name %in% names(pitch_colors)) %>% 
+    ungroup()
+
+  #only for release and approach, we plot the coordinates of where a tangent
+  #line from the coordinate through the previous coordinate would cross the 
+  #plate. This coordinate is then used later to calculate the angle
+  for (i in c(1, 50)) {
+  dat <- dat %>%
+    mutate(
+      !!paste0("z_pos_", i - 1) := release_z + bz * (((i - 1) / 50) * plate_time) + 0.5 * az * (((i - 1) / 50) * plate_time)^2,
+      !!paste0("z_pos_", i) := release_z + bz * ((i / 50) * plate_time) + 0.5 * az * ((i / 50) * plate_time)^2,
+      !!paste0("y_pos_", i - 1) := release_y + by * (((i - 1) / 50) * plate_time) + 0.5 * ay * (((i - 1) / 50) * plate_time)^2,
+      !!paste0("y_pos_", i) := release_y + by * ((i / 50) * plate_time) + 0.5 * ay * ((i / 50) * plate_time)^2, 
+      !!paste0("x_pos_", i - 1) := release_x + bx * (((i - 1) / 50) * plate_time) + 0.5 * ax * (((i - 1) / 50) * plate_time)^2,
+      !!paste0("x_pos_", i) := release_x + bx * ((i / 50) * plate_time) + 0.5 * ax * ((i / 50) * plate_time)^2
+    ) %>%
+    mutate(
+      !!paste0("slope_", i) := (!!sym(paste0("z_pos_", i)) - !!sym(paste0("z_pos_", i - 1))) / (!!sym(paste0("y_pos_", i)) - !!sym(paste0("y_pos_", i - 1))),
+      !!paste0("vertical_angle_", i) := -atan(!!sym(paste0("slope_", i))) * (180 / pi), 
+      !!paste0("slope_x_", i) := (!!sym(paste0("x_pos_", i)) - !!sym(paste0("x_pos_", i - 1))) / (!!sym(paste0("y_pos_", i)) - !!sym(paste0("y_pos_", i - 1))),
+      !!paste0("horizontal_angle_", i) := -atan(!!sym(paste0("slope_x_", i))) * (180 / pi)
+    )
+  }
+ #plot the mean angle for each pitch, as well as a one sd kde around it
+p1 <- dat %>%
+  group_by(pitch_name) %>% mutate(mean_hra = -mean(horizontal_angle_1), mean_vra = mean(vertical_angle_1)) %>% 
+  ggplot(aes(x = -horizontal_angle_1, y = vertical_angle_1, color = pitch_name)) +
+  stat_ellipse(type = "norm", level = 0.68, linetype = "dashed", linewidth = 1.25) +
+  geom_point(aes(mean_hra, mean_vra, fill = pitch_name, color = "black"), size = 5, shape = 21) +
+  labs(
+    x = "Horizontal Release Angle",
+    y = "Vertical Release Angle",
+    color = "Pitch Type"
+  ) +
+  theme_minimal() + 
+  scale_colour_manual(values = pitch_colors) + 
+  scale_fill_manual(values = pitch_colors) + 
+  theme(legend.position = "none", 
+        axis.text.x = element_text(size = 20),
+                  axis.text.y = element_text(size = 20),
+                  axis.title.x = element_text(size = 20),
+                  axis.title.y = element_text(size = 20)) 
+
+p2 <- dat %>%
+  group_by(pitch_name) %>% mutate(mean_hra = -mean(horizontal_angle_50), mean_vra = mean(vertical_angle_50)) %>% 
+  ggplot(aes(x = -horizontal_angle_50, y = vertical_angle_50, color = pitch_name)) +
+  stat_ellipse(type = "norm", level = 0.68, linetype = "dashed", linewidth = 1.25) +
+  geom_point(aes(mean_hra, mean_vra, fill = pitch_name, color = "black"), size = 5, shape = 21) +
+  labs(
+    x = "Horizontal Approach Angle",
+    y = "Vertical Approach Angle",
+    color = "Pitch Type"
+  ) +
+  theme_minimal() + 
+  scale_colour_manual(values = pitch_colors) + 
+  scale_fill_manual(values = pitch_colors) + 
+  theme(legend.position = "none", 
+        axis.text.x = element_text(size = 20),
+                  axis.text.y = element_text(size = 20),
+                  axis.title.x = element_text(size = 20),
+                  axis.title.y = element_text(size = 20))
+
+
+grid.arrange(p1, p2, ncol = 2)
+
+}
+gt_to_grob <- function(gt_table) {
+  temp_file <- tempfile(fileext = ".png")
+  gtsave(gt_table, filename = temp_file)
+  img <- png::readPNG(temp_file)
+  grob <- rasterGrob(img, interpolate = TRUE)
+  return(grob)
+  }
+pitching_dashboard <- function(player, game_year, output_file) {
+  
+  
+  data <- data %>% 
+    filter(year == game_year)
+  
+  trajectory_data <- trajectory_data %>% 
+    filter(year == game_year)
+
+  stats_gt <- pitch_summary(player, game_year, data)        
+  stats_plot <- gt_to_grob(stats_gt)
+  velo_plot <- velo(player, game_year, data)               
+  movements_plot <- movement(player, game_year, data)    
+  tilts <- tilt(player, game_year, data)
+  info <- player_info(player)
+  angles_plot <- approach_angles(player, game_year, trajectory_data)
+  tunnels_plot <- tunnels(player, game_year, trajectory_data)
+  
+ 
+  
+   pitches <- data %>%
+    filter(name == player) %>%
+    group_by(pitch_name) %>%
+    mutate(
+      pct = n() / nrow(data %>% filter(name == player))
+    ) %>% 
+    filter(pct >= .01) %>% 
+    ungroup() %>% 
+     summarise(unique_count = n_distinct(pitch_name)) %>%
+        pull(unique_count)
+  
+  if (pitches < 3){
+    png(output_file, width = 20, height = 15, units = "in", res = 300)
+    
+     grid.arrange(
+       arrangeGrob(info, ncol = 1, 
+                heights = unit(1, "null"), widths = unit(20, "in")),
+    arrangeGrob(stats_plot, ncol = 1, heights = unit(3, "null"), widths = unit(20, "in")), 
+    
+    arrangeGrob(
+      velo_plot, movements_plot, tunnels_plot, 
+      ncol = 3, widths = c(1/3, 1/3, 1/3), heights = unit(1, "null")
+    ),
+    
+    arrangeGrob(tilts, angles_plot, ncol = 2, heights = unit(2, "null")),
+    
+    layout_matrix = rbind(
+      c(1),  
+      c(2),  
+      c(3),
+      c(4)
+    ),
+    heights = c(.25, 0.3, 0.5, 0.45)
+     )
+  
+  } else if (pitches == 3){ 
+     png(output_file, width = 20, height = 16, units = "in", res = 300)
+    
+    grid.arrange(
+       arrangeGrob(info, ncol = 1, 
+                heights = unit(1, "null"), widths = unit(20, "in")),
+    arrangeGrob(stats_plot, ncol = 1, heights = unit(3, "null"), widths = unit(20, "in")), 
+    
+    arrangeGrob(
+      velo_plot, movements_plot, tunnels_plot, 
+      ncol = 3, widths = c(1/3, 1/3, 1/3), heights = unit(1, "null")
+    ),
+    
+    arrangeGrob(tilts, angles_plot, ncol = 2, heights = unit(2, "null")),
+    
+    layout_matrix = rbind(
+      c(1),  
+      c(2),  
+      c(3),
+      c(4)
+    ),
+    heights = c(.25, 0.4, 0.5, 0.45)
+    )
+  
+  } else if (pitches == 4){
+    png(output_file, width = 20, height = 18, units = "in", res = 300)
+    
+    grid.arrange(
+      arrangeGrob(info, ncol = 1, 
+                heights = unit(1, "null"), widths = unit(20, "in")),
+    arrangeGrob(stats_plot, ncol = 1, heights = unit(3, "null"), widths = unit(20, "in")), 
+    
+    arrangeGrob(
+      velo_plot, movements_plot, tunnels_plot, 
+      ncol = 3, widths = c(1/3, 1/3, 1/3), heights = unit(1, "null")
+    ),
+    
+    arrangeGrob(tilts, angles_plot, ncol = 2, heights = unit(2, "null")),
+    
+    layout_matrix = rbind(
+      c(1),  
+      c(2),  
+      c(3),
+      c(4)
+    ),
+    heights = c(.25, 0.5, 0.5, 0.5)
+  )
+  } else if(pitches == 5){
+      png(output_file, width = 20, height = 20, units = "in", res = 300)
+    
+     grid.arrange(
+       arrangeGrob(info, ncol = 1, 
+                heights = unit(1, "null"), widths = unit(20, "in")),
+    arrangeGrob(stats_plot, ncol = 1, heights = unit(3, "null"), widths = unit(20, "in")), 
+    
+    arrangeGrob(
+      velo_plot, movements_plot, tunnels_plot, 
+      ncol = 3, widths = c(1/3, 1/3, 1/3), heights = unit(1, "null")
+    ),
+    
+    arrangeGrob(tilts, angles_plot, ncol = 2, heights = unit(2, "null")),
+    
+    layout_matrix = rbind(
+      c(1),  
+      c(2),  
+      c(3),
+      c(4)
+    ),
+    heights = c(.25, 0.5, 0.5, 0.45)
+  )
+  } else if(pitches == 6){
+      png(output_file, width = 20, height = 20, units = "in", res = 300)
+    grid.arrange(
+      arrangeGrob(info, ncol = 1, 
+                heights = unit(1, "null"), widths = unit(20, "in")),
+    arrangeGrob(stats_plot, ncol = 1, heights = unit(3, "null"), widths = unit(20, "in")), 
+    
+    arrangeGrob(
+      velo_plot, movements_plot, tunnels_plot, 
+      ncol = 3, widths = c(1/3, 1/3, 1/3), heights = unit(1, "null")
+    ),
+    
+    arrangeGrob(tilts, angles_plot, ncol = 2, heights = unit(2, "null")),
+    
+    layout_matrix = rbind(
+      c(1),  
+      c(2),  
+      c(3),
+      c(4)
+    ),
+   heights = c(.25, 0.6, 0.5, 0.45)
+  )
+  } else if (pitches == 7){
+      png(output_file, width = 20, height = 22, units = "in", res = 300)
+    
+    grid.arrange(
+    arrangeGrob(info, ncol = 1, 
+                heights = unit(1, "null"), widths = unit(20, "in")),
+    arrangeGrob(stats_plot, ncol = 1, heights = unit(3, "null"), widths = unit(20, "in")), 
+    
+    arrangeGrob(
+      velo_plot, movements_plot, tunnels_plot, 
+      ncol = 3, widths = c(1/3, 1/3, 1/3), heights = unit(1, "null")
+    ),
+    
+    arrangeGrob(tilts, angles_plot, ncol = 2, heights = unit(2, "null")),
+    
+    layout_matrix = rbind(
+      c(1),  
+      c(2),  
+      c(3), 
+      c(4)
+    ),
+    heights = c(.25, 0.65, 0.5, 0.45)
+  )
+  } else{
+       png(output_file, width = 20, height = 22, units = "in", res = 300)
+    
+     grid.arrange(
+       arrangeGrob(info, ncol = 1, 
+                heights = unit(1, "null"), widths = unit(20, "in")),
+    arrangeGrob(stats_plot, ncol = 1, heights = unit(3, "null"), widths = unit(20, "in")), 
+    
+    arrangeGrob(
+      velo_plot, movements_plot, tunnels_plot, 
+      ncol = 3, widths = c(1/3, 1/3, 1/3), heights = unit(1, "null")
+    ),
+    
+    arrangeGrob(tilts, angles_plot, ncol = 2, heights = unit(2, "null")),
+    
+    layout_matrix = rbind(
+      c(1),  
+      c(2),  
+      c(3),
+      c(4)
+    ),
+    heights = c(.25, 0.7, 0.5, 0.45)
+  )
+    }
+  
+  
+  dev.off()
+}
+
+pitching_dashboard("Brandon Pfaadt", 2025, "summary.png")
