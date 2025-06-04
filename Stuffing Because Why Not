@@ -1,3 +1,9 @@
+install.packages('rsconnect')
+rsconnect::setAccountInfo(name='dbacksmetrics',
+			  token='BB5B228F42D38E1A17212A18694BD235',
+			  secret='<SECRET>')
+library(rsconnect)
+    rsconnect::deployApp('path/to/your/app')
 install.packages("tidyverse")
 install.packages("gt")
 install.packages("gtExtras")
